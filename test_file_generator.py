@@ -1,15 +1,7 @@
 #!/usr/bin/env python3
 """
-LibreOffice OOM Reproducer for Kubernetes Pods
-Target: Exceed 2500 MiB pod limit to trigger OOM kill
-
-Pod Configuration:
-- Memory Request: 1500 MiB (guaranteed)
-- Memory Limit:   2500 MiB (hard limit → OOM if exceeded)
-- Host Memory:    30-40 GB (irrelevant)
-
-This script progressively increases concurrent conversions until the pod
-exceeds 2500 MiB and gets OOM killed.
+LibreOffice OOM Test with PID Memory Tracking and 2000 MiB Cap
+Auto-escalates concurrency until memory reaches 2000 MiB or OOM occurs
 """
 
 import argparse
@@ -22,102 +14,91 @@ import time
 import uuid
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, Optional
+from typing import List, Dict, Optional
 from dataclasses import dataclass
+import threading
+
+# Check for psutil
+try:
+    import psutil
+except ImportError:
+    print("ERROR: psutil not installed")
+    print("Install with: pip install psutil --break-system-packages")
+    sys.exit(1)
+
+# Global memory tracking
+memory_cap_reached = threading.Event()
+MEMORY_CAP_MIB = 2000
 
 # =============================================================================
-# CONTAINER MEMORY TRACKING (POD LIMITS)
+# MEMORY TRACKING
 # =============================================================================
 
-def get_pod_memory_limit() -> Optional[int]:
-    """
-    Detect the pod's cgroup memory limit in bytes.
-    This should be 2500 MiB = 2621440000 bytes
-    """
-    cgroup_paths = [
-        '/sys/fs/cgroup/memory.max',                          # cgroup v2
-        '/sys/fs/cgroup/memory/memory.limit_in_bytes',        # cgroup v1
-    ]
-    
-    for path in cgroup_paths:
-        if Path(path).exists():
-            try:
-                limit = Path(path).read_text().strip()
-                if limit == 'max':
-                    continue
-                limit_bytes = int(limit)
-                # Only accept limits < 100GB (pod limits are much smaller)
-                if limit_bytes < 100 * 1024 * 1024 * 1024:
-                    return limit_bytes
-            except:
-                continue
-    return None
+def get_all_libreoffice_pids() -> List[int]:
+    """Find all LibreOffice/soffice process PIDs"""
+    pids = []
+    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+        try:
+            name = proc.info['name'].lower()
+            cmdline = ' '.join(proc.info['cmdline'] or []).lower()
+            if 'soffice' in name or 'libreoffice' in name or 'soffice' in cmdline:
+                pids.append(proc.info['pid'])
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return pids
 
-def get_pod_memory_usage() -> Optional[int]:
-    """
-    Get current pod memory usage in bytes from cgroup.
-    """
-    cgroup_paths = [
-        '/sys/fs/cgroup/memory.current',                      # cgroup v2
-        '/sys/fs/cgroup/memory/memory.usage_in_bytes',        # cgroup v1
-    ]
-    
-    for path in cgroup_paths:
-        if Path(path).exists():
-            try:
-                usage = Path(path).read_text().strip()
-                return int(usage)
-            except:
-                continue
-    return None
+def get_process_memory_mib(pid: int) -> float:
+    """Get memory usage in MiB for a specific PID"""
+    try:
+        proc = psutil.Process(pid)
+        mem_info = proc.memory_info()
+        return mem_info.rss / (1024 * 1024)
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return 0.0
 
-def get_memory_pressure() -> Dict[str, any]:
-    """
-    Get pod memory statistics relative to the 2500 MiB limit.
-    """
-    limit_bytes = get_pod_memory_limit()
-    usage_bytes = get_pod_memory_usage()
+def get_total_libreoffice_memory() -> Dict[str, float]:
+    """Get total memory used by all LibreOffice processes"""
+    pids = get_all_libreoffice_pids()
+    total_rss_mib = 0.0
+    process_details = []
     
-    if limit_bytes and usage_bytes:
-        limit_mib = limit_bytes / (1024 * 1024)
-        usage_mib = usage_bytes / (1024 * 1024)
-        available_mib = (limit_bytes - usage_bytes) / (1024 * 1024)
-        percent = (usage_bytes / limit_bytes) * 100
+    for pid in pids:
+        mem_mib = get_process_memory_mib(pid)
+        if mem_mib > 0:
+            total_rss_mib += mem_mib
+            process_details.append({'pid': pid, 'memory_mib': mem_mib})
+    
+    return {
+        'total_mib': total_rss_mib,
+        'process_count': len(pids),
+        'processes': process_details
+    }
+
+def memory_monitor_thread(interval: float = 0.5, verbose: bool = False):
+    """Background thread to monitor memory and trigger cap alert"""
+    global memory_cap_reached
+    
+    while not memory_cap_reached.is_set():
+        mem_stats = get_total_libreoffice_memory()
+        total_mib = mem_stats['total_mib']
         
-        # Calculate pressure zones
-        if percent < 60:  # < 1500 MiB
-            zone = "SAFE"
-            color = "🟢"
-        elif percent < 80:  # 1500-2000 MiB
-            zone = "WARNING"
-            color = "🟡"
-        elif percent < 95:  # 2000-2375 MiB
-            zone = "DANGER"
-            color = "🟠"
-        else:  # > 2375 MiB
-            zone = "CRITICAL"
-            color = "🔴"
+        if verbose and mem_stats['process_count'] > 0:
+            print(f"[MEMORY MONITOR] Total: {total_mib:.1f} MiB across {mem_stats['process_count']} processes")
         
-        return {
-            'limit_mib': limit_mib,
-            'usage_mib': usage_mib,
-            'available_mib': available_mib,
-            'percent': percent,
-            'zone': zone,
-            'color': color,
-            'has_limit': True
-        }
-    else:
-        # Fallback - no cgroup limit detected
-        return {
-            'limit_mib': 0,
-            'usage_mib': 0,
-            'available_mib': 0,
-            'percent': 0,
-            'zone': 'UNKNOWN',
-            'color': '⚪',
-            'has_limit': False
-        }
+        if total_mib >= MEMORY_CAP_MIB:
+            memory_cap_reached.set()
+            print("\n" + "="*80)
+            print("MEMORY CAP REACHED: {:.1f} MiB >= {} MiB".format(total_mib, MEMORY_CAP_MIB))
+            print("="*80)
+            print("Process breakdown:")
+            for proc in mem_stats['processes']:
+                print("  PID {}: {:.1f} MiB".format(proc['pid'], proc['memory_mib']))
+            print("="*80)
+            print("Stopping test to prevent OOM kill")
+            print("="*80)
+            break
+        
+        time.sleep(interval)
 
 # =============================================================================
 # LIBREOFFICE UTILITIES
@@ -151,22 +132,26 @@ class ConversionResult:
     error: str = ""
 
 def convert_to_pdf(input_path: Path, soffice: str) -> ConversionResult:
-    """
-    Convert document to PDF with memory tracking.
-    Uses default environment (no special fixes) since those broke your setup.
-    """
+    """Convert document to PDF with memory tracking"""
     start = time.time()
-    mem_before = get_memory_pressure()
     
-    work_dir = Path(tempfile.gettempdir()) / f'lo_oom_{uuid.uuid4().hex[:8]}'
+    # Check if cap already reached
+    if memory_cap_reached.is_set():
+        return ConversionResult(
+            input_path.name, 'SKIPPED', 0.0, -2, 0.0, 0.0,
+            error="Memory cap reached before conversion started"
+        )
+    
+    mem_before = get_total_libreoffice_memory()
+    
+    work_dir = Path(tempfile.gettempdir()) / f'lo_test_{uuid.uuid4().hex[:8]}'
     work_dir.mkdir(exist_ok=True)
     
     try:
-        # Copy file to work directory
         tmp_input = work_dir / input_path.name
         shutil.copy(input_path, tmp_input)
         
-        # Build command with profile isolation (prevents "already running" errors)
+        # Profile isolation
         profile_dir = (work_dir / 'profile').absolute()
         profile_dir.mkdir(exist_ok=True)
         
@@ -181,7 +166,6 @@ def convert_to_pdf(input_path: Path, soffice: str) -> ConversionResult:
             str(tmp_input)
         ]
         
-        # Run conversion
         result = subprocess.run(
             cmd,
             capture_output=True,
@@ -190,19 +174,19 @@ def convert_to_pdf(input_path: Path, soffice: str) -> ConversionResult:
             cwd=str(work_dir)
         )
         
-        mem_after = get_memory_pressure()
+        mem_after = get_total_libreoffice_memory()
         duration = time.time() - start
         
-        # Check for OOM kill (exit code 137)
+        # Check for OOM kill (exit 137)
         if result.returncode == 137:
             return ConversionResult(
                 input_path.name,
                 'OOM_KILLED',
                 duration,
                 137,
-                mem_before['usage_mib'],
-                mem_after['usage_mib'],
-                error="⚠️ KILLED BY OOM - Pod exceeded 2500 MiB limit"
+                mem_before['total_mib'],
+                mem_after['total_mib'],
+                error="Process killed by OOM killer"
             )
         
         # Check for success
@@ -213,8 +197,8 @@ def convert_to_pdf(input_path: Path, soffice: str) -> ConversionResult:
                 'SUCCESS',
                 round(duration, 2),
                 0,
-                mem_before['usage_mib'],
-                mem_after['usage_mib']
+                mem_before['total_mib'],
+                mem_after['total_mib']
             )
         
         # Failed
@@ -223,32 +207,32 @@ def convert_to_pdf(input_path: Path, soffice: str) -> ConversionResult:
             'FAILED',
             round(duration, 2),
             result.returncode,
-            mem_before['usage_mib'],
-            mem_after['usage_mib'],
-            error=result.stderr[:150] if result.stderr else "No PDF output"
+            mem_before['total_mib'],
+            mem_after['total_mib'],
+            error=result.stderr[:100] if result.stderr else "No PDF output"
         )
     
     except subprocess.TimeoutExpired:
-        mem_after = get_memory_pressure()
+        mem_after = get_total_libreoffice_memory()
         return ConversionResult(
             input_path.name,
             'TIMEOUT',
             time.time() - start,
             -1,
-            mem_before['usage_mib'],
-            mem_after['usage_mib'],
-            error="Timeout (>180s)"
+            mem_before['total_mib'],
+            mem_after['total_mib'],
+            error="Conversion timeout (>180s)"
         )
     except Exception as e:
-        mem_after = get_memory_pressure()
+        mem_after = get_total_libreoffice_memory()
         return ConversionResult(
             input_path.name,
             'ERROR',
             time.time() - start,
             -1,
-            mem_before['usage_mib'],
-            mem_after['usage_mib'],
-            error=str(e)[:150]
+            mem_before['total_mib'],
+            mem_after['total_mib'],
+            error=str(e)[:100]
         )
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -257,69 +241,83 @@ def convert_to_pdf(input_path: Path, soffice: str) -> ConversionResult:
 # TEST RUNNER
 # =============================================================================
 
-def print_memory_bar(percent: float, width: int = 50):
-    """Print visual memory usage bar"""
-    filled = int((percent / 100) * width)
-    bar = '█' * filled + '░' * (width - filled)
-    return f"[{bar}] {percent:.1f}%"
-
-def run_oom_test(concurrent: int, test_files: List[Path], soffice: str, verbose: bool = False):
-    """
-    Run OOM stress test with specified concurrency level.
-    Returns True if OOM was triggered.
-    """
-    mem = get_memory_pressure()
+def run_concurrent_test(concurrent: int, test_files: List[Path], soffice: str, verbose: bool = False) -> Dict:
+    """Run conversions at specified concurrency level"""
     
-    print(f"\n{'='*80}")
-    print(f"🔄 RUNNING TEST: {concurrent} concurrent conversions")
-    print(f"{'='*80}")
-    print(f"{mem['color']} Memory: {mem['usage_mib']:.0f}/{mem['limit_mib']:.0f} MiB "
-          f"({mem['percent']:.1f}%) - {mem['zone']}")
-    print(f"   Available: {mem['available_mib']:.0f} MiB")
-    print(f"   {print_memory_bar(mem['percent'])}")
+    print("\n" + "="*80)
+    print("RUNNING TEST: {} concurrent conversions".format(concurrent))
+    print("="*80)
+    
+    mem_start = get_total_libreoffice_memory()
+    print("Memory at start: {:.1f} MiB ({} processes)".format(
+        mem_start['total_mib'], mem_start['process_count']))
     print()
     
     results = []
     oom_triggered = False
+    cap_hit = False
     
     with ThreadPoolExecutor(max_workers=concurrent) as executor:
-        # Submit all conversions
         futures = {executor.submit(convert_to_pdf, f, soffice): f for f in test_files}
         
-        # Process results as they complete
         for future in as_completed(futures):
+            # Check if cap was reached
+            if memory_cap_reached.is_set():
+                cap_hit = True
+                # Cancel remaining futures
+                for f in futures:
+                    f.cancel()
+                break
+            
             res = future.result()
             results.append(res)
             
-            # Update memory stats
-            mem = get_memory_pressure()
+            mem_current = get_total_libreoffice_memory()
             
-            # Format output
-            status_icon = "✓" if res.status == 'SUCCESS' else "✗"
+            status_symbol = "[SUCCESS]" if res.status == 'SUCCESS' else "[FAILED]"
             if res.status == 'OOM_KILLED':
-                status_icon = "💀"
+                status_symbol = "[OOM]"
                 oom_triggered = True
             
-            print(f"{status_icon} {res.filename:<25} {res.status:<12} "
-                  f"{res.duration:>6.2f}s | "
-                  f"{mem['color']} {mem['usage_mib']:>7.0f} MiB ({mem['percent']:>5.1f}%) | "
-                  f"Exit: {res.exit_code}")
+            print("{} {} | {:.2f}s | Mem: {:.1f} -> {:.1f} MiB | Total: {:.1f} MiB | Exit: {}".format(
+                status_symbol,
+                res.filename[:20].ljust(20),
+                res.duration,
+                res.memory_before_mib,
+                res.memory_after_mib,
+                mem_current['total_mib'],
+                res.exit_code
+            ))
             
             if verbose and res.error:
-                print(f"   └─ {res.error}")
+                print("  Error: {}".format(res.error))
     
     # Summary
     success = sum(1 for r in results if r.status == 'SUCCESS')
     failed = sum(1 for r in results if r.status == 'FAILED')
     oom = sum(1 for r in results if 'OOM' in r.status)
+    skipped = sum(1 for r in results if r.status == 'SKIPPED')
     
-    print(f"\n📊 Results: {success} success, {failed} failed, {oom} OOM killed")
+    mem_final = get_total_libreoffice_memory()
     
-    final_mem = get_memory_pressure()
-    print(f"{final_mem['color']} Final Memory: {final_mem['usage_mib']:.0f}/{final_mem['limit_mib']:.0f} MiB "
-          f"({final_mem['percent']:.1f}%)")
+    print("\nResults: {} success, {} failed, {} OOM, {} skipped".format(
+        success, failed, oom, skipped))
+    print("Final memory: {:.1f} MiB ({} processes)".format(
+        mem_final['total_mib'], mem_final['process_count']))
     
-    return oom_triggered
+    if verbose and mem_final['process_count'] > 0:
+        print("\nProcess details:")
+        for proc in mem_final['processes']:
+            print("  PID {}: {:.1f} MiB".format(proc['pid'], proc['memory_mib']))
+    
+    return {
+        'oom_triggered': oom_triggered,
+        'cap_reached': cap_hit,
+        'success': success,
+        'failed': failed,
+        'oom': oom,
+        'final_memory_mib': mem_final['total_mib']
+    }
 
 # =============================================================================
 # MAIN
@@ -327,103 +325,117 @@ def run_oom_test(concurrent: int, test_files: List[Path], soffice: str, verbose:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='LibreOffice OOM Reproducer for K8s Pods (2500 MiB limit)'
+        description='LibreOffice OOM Test with Memory Cap and PID Tracking'
     )
-    parser.add_argument('--concurrent', type=int, help="Fixed concurrency level")
+    parser.add_argument('--concurrent', type=int, help='Fixed concurrency level')
     parser.add_argument('--auto-escalate', action='store_true',
-                       help="Auto-escalate concurrency until OOM is triggered")
-    parser.add_argument('--start', type=int, default=2,
-                       help="Starting concurrency for auto-escalate (default: 2)")
-    parser.add_argument('--step', type=int, default=2,
-                       help="Concurrency increment for auto-escalate (default: 2)")
-    parser.add_argument('--max', type=int, default=30,
-                       help="Maximum concurrency for auto-escalate (default: 30)")
+                       help='Auto-escalate concurrency until cap/OOM')
+    parser.add_argument('--start', type=int, default=5,
+                       help='Starting concurrency (default: 5)')
+    parser.add_argument('--step', type=int, default=5,
+                       help='Concurrency increment (default: 5)')
+    parser.add_argument('--max', type=int, default=50,
+                       help='Maximum concurrency (default: 50)')
     parser.add_argument('--verbose', '-v', action='store_true',
-                       help="Show detailed error output")
+                       help='Verbose output with process details')
+    parser.add_argument('--monitor-interval', type=float, default=0.5,
+                       help='Memory monitoring interval in seconds (default: 0.5)')
     args = parser.parse_args()
     
     # Find LibreOffice
     soffice = find_libreoffice()
     if not soffice:
-        print("❌ ERROR: LibreOffice not found!")
+        print("ERROR: LibreOffice not found")
         sys.exit(1)
     
     # Find test files
     test_files_dir = Path('./test_files')
     if not test_files_dir.exists():
-        print(f"❌ ERROR: {test_files_dir} directory not found!")
+        print("ERROR: {} directory not found".format(test_files_dir))
         sys.exit(1)
     
     test_files = list(test_files_dir.glob('*.*'))
     if not test_files:
-        print(f"❌ ERROR: No files found in {test_files_dir}")
+        print("ERROR: No files found in {}".format(test_files_dir))
         sys.exit(1)
     
-    # Check pod memory limit
-    mem = get_memory_pressure()
-    
+    # Display configuration
     print("\n" + "="*80)
-    print("🎯 LIBREOFFICE OOM STRESS TESTER")
+    print("LIBREOFFICE OOM TEST WITH MEMORY CAP")
     print("="*80)
-    print(f"📦 Pod Memory Configuration:")
-    
-    if mem['has_limit']:
-        print(f"   ✓ Memory Limit Detected: {mem['limit_mib']:.0f} MiB")
-        print(f"   Current Usage: {mem['usage_mib']:.0f} MiB ({mem['percent']:.1f}%)")
-        print(f"   Available: {mem['available_mib']:.0f} MiB")
-        print(f"   Target: Exceed {mem['limit_mib']:.0f} MiB to trigger OOM")
-    else:
-        print(f"   ⚠️  WARNING: No cgroup memory limit detected!")
-        print(f"   This might not be running in a memory-limited container.")
-        print(f"   Continuing anyway...")
-    
-    print(f"\n📂 Test Configuration:")
-    print(f"   LibreOffice: {soffice}")
-    print(f"   Test Files: {len(test_files)} files")
+    print("LibreOffice: {}".format(soffice))
+    print("Test files: {}".format(len(test_files)))
     for f in test_files:
         size_mb = f.stat().st_size / (1024 * 1024)
-        print(f"      • {f.name} ({size_mb:.2f} MB)")
+        print("  - {} ({:.2f} MB)".format(f.name, size_mb))
+    print("\nMemory cap: {} MiB".format(MEMORY_CAP_MIB))
+    print("Target: Reach {} MiB or trigger OOM (exit 137)".format(MEMORY_CAP_MIB))
     
-    # Run test(s)
+    # Start memory monitor thread
+    monitor = threading.Thread(
+        target=memory_monitor_thread,
+        args=(args.monitor_interval, args.verbose),
+        daemon=True
+    )
+    monitor.start()
+    
+    # Run tests
     if args.concurrent:
         # Fixed concurrency mode
-        print(f"\n🎯 Mode: Fixed concurrency ({args.concurrent} workers)")
-        run_oom_test(args.concurrent, test_files, soffice, args.verbose)
-    
+        print("\nMode: Fixed concurrency ({} workers)".format(args.concurrent))
+        result = run_concurrent_test(args.concurrent, test_files, soffice, args.verbose)
+        
     elif args.auto_escalate:
         # Auto-escalation mode
-        print(f"\n🎯 Mode: Auto-escalate ({args.start} → {args.max}, step {args.step})")
-        print(f"   Strategy: Increase concurrency until OOM is triggered")
+        print("\nMode: Auto-escalate ({} -> {}, step {})".format(
+            args.start, args.max, args.step))
+        print("Strategy: Increase concurrency until {} MiB cap or OOM".format(MEMORY_CAP_MIB))
         
-        oom_triggered = False
         current = args.start
         
-        while current <= args.max and not oom_triggered:
-            oom_triggered = run_oom_test(current, test_files, soffice, args.verbose)
+        while current <= args.max:
+            if memory_cap_reached.is_set():
+                print("\nMemory cap reached. Stopping escalation.")
+                break
             
-            if oom_triggered:
-                print(f"\n🎉 SUCCESS! OOM triggered at concurrency level: {current}")
-                print(f"   This means ~{current} concurrent LibreOffice processes")
-                print(f"   exceeded the 2500 MiB pod limit.")
+            result = run_concurrent_test(current, test_files, soffice, args.verbose)
+            
+            if result['oom_triggered']:
+                print("\n" + "="*80)
+                print("OOM TRIGGERED at concurrency level: {}".format(current))
+                print("="*80)
+                break
+            
+            if result['cap_reached']:
+                print("\n" + "="*80)
+                print("Memory cap ({} MiB) reached at concurrency: {}".format(
+                    MEMORY_CAP_MIB, current))
+                print("Final memory: {:.1f} MiB".format(result['final_memory_mib']))
+                print("="*80)
                 break
             
             if current < args.max:
                 current += args.step
-                print(f"\n⬆️  Increasing concurrency to {current}...")
-                time.sleep(2)  # Brief pause between escalations
+                print("\nIncreasing concurrency to {}...".format(current))
+                time.sleep(2)
         
-        if not oom_triggered:
-            print(f"\n⚠️  OOM not triggered even at {args.max} concurrent conversions.")
-            print(f"   Either the limit is higher than expected, or files are too small.")
+        if current > args.max and not result['oom_triggered'] and not result['cap_reached']:
+            print("\n" + "="*80)
+            print("Reached max concurrency ({}) without hitting cap or OOM".format(args.max))
+            print("Final memory: {:.1f} MiB".format(result['final_memory_mib']))
+            print("="*80)
     
     else:
-        # Default: single run with 6 concurrent
-        print(f"\n🎯 Mode: Default (6 concurrent conversions)")
-        print(f"   Tip: Use --auto-escalate to find OOM threshold automatically")
-        run_oom_test(6, test_files, soffice, args.verbose)
+        # Default mode
+        print("\nMode: Default (10 concurrent conversions)")
+        result = run_concurrent_test(10, test_files, soffice, args.verbose)
+    
+    # Wait for monitor thread to finish
+    memory_cap_reached.set()
+    monitor.join(timeout=1)
     
     print("\n" + "="*80)
-    print("✅ TEST COMPLETE")
+    print("TEST COMPLETE")
     print("="*80)
 
 if __name__ == '__main__':
