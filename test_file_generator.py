@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
-LibreOffice OOM Test Suite - ZERO DEPENDENCIES
+LibreOffice OOM Test Suite - ZERO DEPENDENCIES (Fixed Version)
 
 This script creates test Office files and runs stress tests using ONLY
 Python standard library. No pip packages required!
 
-Creates valid PPTX/XLSX files using zipfile + XML (Office Open XML format).
-
 Usage:
-    python3 test_suite_standalone.py                     # Run full test
-    python3 test_suite_standalone.py --generate-only     # Just create files
-    python3 test_suite_standalone.py --test-only         # Test existing files
-    python3 test_suite_standalone.py --level heavy       # More stress
+    python3 test_suite_fixed.py                     # Run full test
+    python3 test_suite_fixed.py --generate-only     # Just create files
+    python3 test_suite_fixed.py --test-only         # Test existing files
+    python3 test_suite_fixed.py --level heavy       # More stress
+    python3 test_suite_fixed.py --compare           # Compare with/without fixes
 
 Requirements:
     - Python 3.6+ (standard library only - NO PIP PACKAGES)
@@ -179,7 +178,6 @@ def create_pptx(num_slides: int = 10, text_blocks: int = 3) -> bytes:
         
         # Create each slide
         for slide_num in range(num_slides):
-            # Generate text content for this slide
             text_shapes = []
             for block_idx in range(text_blocks):
                 x_pos = 500000 + (block_idx % 2) * 4000000
@@ -230,7 +228,6 @@ def create_pptx(num_slides: int = 10, text_blocks: int = 3) -> bytes:
 </p:sld>'''
             zf.writestr(f'ppt/slides/slide{slide_num + 1}.xml', slide_xml)
             
-            # Slide rels
             zf.writestr(f'ppt/slides/_rels/slide{slide_num + 1}.xml.rels', '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
   <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>
@@ -251,7 +248,6 @@ def create_xlsx(num_sheets: int = 3, rows_per_sheet: int = 100, cols: int = 10) 
     buf = io.BytesIO()
     
     with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-        # [Content_Types].xml
         sheet_overrides = '\n'.join(
             f'  <Override PartName="/xl/worksheets/sheet{i+1}.xml" '
             f'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
@@ -267,13 +263,11 @@ def create_xlsx(num_sheets: int = 3, rows_per_sheet: int = 100, cols: int = 10) 
 {sheet_overrides}
 </Types>''')
         
-        # _rels/.rels
         zf.writestr('_rels/.rels', '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
   <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
 </Relationships>''')
         
-        # xl/workbook.xml
         sheet_defs = '\n'.join(
             f'    <sheet name="Sheet{i+1}" sheetId="{i+1}" r:id="rId{i+1}"/>'
             for i in range(num_sheets)
@@ -286,7 +280,6 @@ def create_xlsx(num_sheets: int = 3, rows_per_sheet: int = 100, cols: int = 10) 
   </sheets>
 </workbook>''')
         
-        # xl/_rels/workbook.xml.rels
         sheet_rels = '\n'.join(
             f'  <Relationship Id="rId{i+1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{i+1}.xml"/>'
             for i in range(num_sheets)
@@ -298,7 +291,6 @@ def create_xlsx(num_sheets: int = 3, rows_per_sheet: int = 100, cols: int = 10) 
   <Relationship Id="rId{num_sheets+2}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>
 </Relationships>''')
         
-        # xl/styles.xml (minimal)
         zf.writestr('xl/styles.xml', '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
   <fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>
@@ -308,7 +300,6 @@ def create_xlsx(num_sheets: int = 3, rows_per_sheet: int = 100, cols: int = 10) 
   <cellXfs count="1"><xf/></cellXfs>
 </styleSheet>''')
         
-        # Collect all shared strings
         shared_strings = []
         shared_string_map = {}
         
@@ -318,11 +309,9 @@ def create_xlsx(num_sheets: int = 3, rows_per_sheet: int = 100, cols: int = 10) 
                 shared_strings.append(s)
             return shared_string_map[s]
         
-        # Create worksheets
         for sheet_idx in range(num_sheets):
             rows_xml = []
             
-            # Header row
             header_cells = []
             for c in range(cols):
                 col_letter = chr(65 + c) if c < 26 else f"A{chr(65 + c - 26)}"
@@ -331,41 +320,34 @@ def create_xlsx(num_sheets: int = 3, rows_per_sheet: int = 100, cols: int = 10) 
                 header_cells.append(f'<c r="{col_letter}1" t="s"><v>{str_idx}</v></c>')
             rows_xml.append(f'    <row r="1">{"".join(header_cells)}</row>')
             
-            # Data rows
             for row_num in range(2, rows_per_sheet + 2):
                 cells = []
                 for c in range(cols):
                     col_letter = chr(65 + c) if c < 26 else f"A{chr(65 + c - 26)}"
                     cell_ref = f"{col_letter}{row_num}"
                     
-                    # Vary data types
                     if c % 3 == 0:
-                        # Number
                         value = random.randint(1, 10000)
                         cells.append(f'<c r="{cell_ref}"><v>{value}</v></c>')
                     elif c % 3 == 1:
-                        # Decimal
                         value = round(random.uniform(0, 1000), 2)
                         cells.append(f'<c r="{cell_ref}"><v>{value}</v></c>')
                     else:
-                        # Text
                         text = random_text(3)
                         str_idx = get_string_index(text)
                         cells.append(f'<c r="{cell_ref}" t="s"><v>{str_idx}</v></c>')
                 
                 rows_xml.append(f'    <row r="{row_num}">{"".join(cells)}</row>')
             
-            # Write worksheet
             last_col = chr(65 + cols - 1) if cols <= 26 else f"A{chr(65 + cols - 27)}"
             zf.writestr(f'xl/worksheets/sheet{sheet_idx + 1}.xml', f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
   <dimension ref="A1:{last_col}{rows_per_sheet + 1}"/>
   <sheetData>
-{"chr(10)".join(rows_xml)}
+{chr(10).join(rows_xml)}
   </sheetData>
 </worksheet>''')
         
-        # xl/sharedStrings.xml
         ss_items = '\n'.join(f'  <si><t>{s}</t></si>' for s in shared_strings)
         zf.writestr('xl/sharedStrings.xml', f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="{len(shared_strings)}" uniqueCount="{len(shared_strings)}">
@@ -434,7 +416,7 @@ def get_optimized_env() -> Dict[str, str]:
 
 
 # =============================================================================
-# CONVERSION & TESTING
+# CONVERSION & TESTING (FIXED VERSION)
 # =============================================================================
 
 @dataclass
@@ -452,84 +434,130 @@ def convert_to_pdf(
     soffice: str,
     timeout: int = 120,
     use_unique_profile: bool = True,
-    use_optimized_env: bool = True
+    use_optimized_env: bool = True,
+    debug: bool = False
 ) -> ConversionResult:
-    """Convert a file to PDF using LibreOffice."""
+    """Convert a file to PDF using LibreOffice (FIXED VERSION)."""
     
     input_size = input_path.stat().st_size / 1024
     start = time.time()
     
-    with tempfile.TemporaryDirectory(prefix='lo_') as tmp:
-        tmp_path = Path(tmp)
-        
-        # Copy input to temp
-        tmp_input = tmp_path / input_path.name
+    # Use a persistent temp directory for output (not deleted immediately)
+    tmp_base = Path(tempfile.gettempdir())
+    conversion_id = uuid.uuid4().hex[:8]
+    work_dir = tmp_base / f'lo_convert_{conversion_id}'
+    work_dir.mkdir(exist_ok=True)
+    
+    try:
+        # Copy input to work directory
+        tmp_input = work_dir / input_path.name
         shutil.copy(input_path, tmp_input)
         
         # Build command
         cmd = [
             soffice,
             '--headless',
-            '--invisible',
-            '--nodefault',
-            '--nofirststartwizard',
-            '--nolockcheck',
-            '--nologo',
-            '--norestore',
+            '--convert-to', 'pdf',
+            '--outdir', str(work_dir),
         ]
         
+        # Add unique profile if enabled (KEY FIX FOR OOM)
         if use_unique_profile:
-            profile = tmp_path / f'profile_{uuid.uuid4().hex[:8]}'
-            profile.mkdir()
-            cmd.append(f'-env:UserInstallation=file://{profile}')
+            profile_dir = work_dir / 'profile'
+            profile_dir.mkdir(exist_ok=True)
+            cmd.append(f'-env:UserInstallation=file://{profile_dir}')
         
-        cmd.extend(['--convert-to', 'pdf', '--outdir', str(tmp_path), str(tmp_input)])
+        # Add input file at the end
+        cmd.append(str(tmp_input))
         
         env = get_optimized_env() if use_optimized_env else os.environ.copy()
         
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
-            duration = time.time() - start
-            
-            # Find output PDF
-            pdfs = list(tmp_path.glob('*.pdf'))
-            if pdfs:
-                output_size = pdfs[0].stat().st_size / 1024
-                return ConversionResult(
-                    filename=input_path.name,
-                    input_size_kb=input_size,
-                    output_size_kb=output_size,
-                    status='success',
-                    duration_sec=round(duration, 2)
-                )
-            else:
-                return ConversionResult(
-                    filename=input_path.name,
-                    input_size_kb=input_size,
-                    output_size_kb=0,
-                    status='failed',
-                    duration_sec=round(duration, 2),
-                    error=result.stderr[:200] if result.stderr else 'No PDF output'
-                )
+        if debug:
+            print(f"  DEBUG: Running {' '.join(cmd)}")
         
-        except subprocess.TimeoutExpired:
+        result = subprocess.run(
+            cmd, 
+            capture_output=True, 
+            text=True, 
+            timeout=timeout, 
+            env=env,
+            cwd=str(work_dir)  # Run from work directory
+        )
+        
+        duration = time.time() - start
+        
+        if debug:
+            print(f"  DEBUG: Return code: {result.returncode}")
+            print(f"  DEBUG: stdout: {result.stdout[:200] if result.stdout else 'empty'}")
+            print(f"  DEBUG: stderr: {result.stderr[:200] if result.stderr else 'empty'}")
+        
+        # Look for PDF output
+        # LibreOffice creates PDF with same base name as input
+        expected_pdf_name = tmp_input.stem + '.pdf'
+        expected_pdf = work_dir / expected_pdf_name
+        
+        if debug:
+            print(f"  DEBUG: Looking for {expected_pdf}")
+            print(f"  DEBUG: Files in work_dir: {list(work_dir.glob('*'))}")
+        
+        # Check for the PDF
+        if expected_pdf.exists():
+            output_size = expected_pdf.stat().st_size / 1024
             return ConversionResult(
                 filename=input_path.name,
                 input_size_kb=input_size,
-                output_size_kb=0,
-                status='timeout',
-                duration_sec=timeout,
-                error=f'Timed out after {timeout}s'
+                output_size_kb=output_size,
+                status='success',
+                duration_sec=round(duration, 2)
             )
-        except Exception as e:
+        
+        # Fallback: look for any PDF in the directory
+        pdf_files = list(work_dir.glob('*.pdf'))
+        if pdf_files:
+            output_size = pdf_files[0].stat().st_size / 1024
             return ConversionResult(
                 filename=input_path.name,
                 input_size_kb=input_size,
-                output_size_kb=0,
-                status='error',
-                duration_sec=time.time() - start,
-                error=str(e)[:200]
+                output_size_kb=output_size,
+                status='success',
+                duration_sec=round(duration, 2)
             )
+        
+        # No PDF found
+        error_msg = result.stderr[:300] if result.stderr else 'No PDF output created'
+        return ConversionResult(
+            filename=input_path.name,
+            input_size_kb=input_size,
+            output_size_kb=0,
+            status='failed',
+            duration_sec=round(duration, 2),
+            error=error_msg
+        )
+    
+    except subprocess.TimeoutExpired:
+        return ConversionResult(
+            filename=input_path.name,
+            input_size_kb=input_size,
+            output_size_kb=0,
+            status='timeout',
+            duration_sec=timeout,
+            error=f'Timed out after {timeout}s'
+        )
+    except Exception as e:
+        return ConversionResult(
+            filename=input_path.name,
+            input_size_kb=input_size,
+            output_size_kb=0,
+            status='error',
+            duration_sec=time.time() - start,
+            error=str(e)[:200]
+        )
+    finally:
+        # Cleanup work directory
+        try:
+            shutil.rmtree(work_dir, ignore_errors=True)
+        except:
+            pass
 
 
 # =============================================================================
@@ -589,7 +617,6 @@ def generate_test_files(output_dir: Path, level: str = 'medium', verbose: bool =
     if verbose:
         print_info(f"Generating {level} test files in {output_dir}")
     
-    # Create PPTX files
     for cfg in config['pptx']:
         if verbose:
             print(f"  Creating {cfg['name']} ({cfg['slides']} slides)...", end=' ', flush=True)
@@ -602,7 +629,6 @@ def generate_test_files(output_dir: Path, level: str = 'medium', verbose: bool =
         if verbose:
             print(f"{len(data) / 1024:.1f} KB")
     
-    # Create XLSX files
     for cfg in config['xlsx']:
         if verbose:
             print(f"  Creating {cfg['name']} ({cfg['rows']} rows x {cfg['sheets']} sheets)...", end=' ', flush=True)
@@ -624,7 +650,8 @@ def run_stress_test(
     rounds: int = 2,
     timeout: int = 120,
     use_fixes: bool = True,
-    verbose: bool = True
+    verbose: bool = True,
+    debug: bool = False
 ) -> Dict:
     """Run stress test on files in test_dir."""
     
@@ -633,7 +660,6 @@ def run_stress_test(
         print_err("LibreOffice not found!")
         sys.exit(1)
     
-    # Find test files
     files = list(test_dir.glob('*.pptx')) + list(test_dir.glob('*.xlsx'))
     if not files:
         print_err(f"No test files found in {test_dir}")
@@ -642,10 +668,9 @@ def run_stress_test(
     if verbose:
         print_info(f"Found {len(files)} test files")
         print_info(f"Running {rounds} round(s) with {concurrent} concurrent conversions")
-        print_info(f"Using fixes: {use_fixes}")
+        print_info(f"Using OOM fixes: {use_fixes}")
         print()
     
-    # Build task list
     tasks = [(f, r) for r in range(rounds) for f in files]
     results: List[ConversionResult] = []
     
@@ -657,7 +682,8 @@ def run_stress_test(
             executor.submit(
                 convert_to_pdf, f, soffice, timeout,
                 use_unique_profile=use_fixes,
-                use_optimized_env=use_fixes
+                use_optimized_env=use_fixes,
+                debug=debug
             ): (f, r) for f, r in tasks
         }
         
@@ -666,7 +692,6 @@ def run_stress_test(
             done += 1
             f, r = futures[future]
             
-            # Check memory
             mem = get_memory_info()
             if mem['used_mb'] > peak_memory:
                 peak_memory = mem['used_mb']
@@ -677,15 +702,16 @@ def run_stress_test(
                 
                 if verbose:
                     icon = '✓' if result.status == 'success' else '✗'
-                    print(f"[{done}/{len(tasks)}] {icon} {result.filename} "
-                          f"({result.duration_sec}s) | Mem: {mem['used_mb']/1024:.1f}GB ({mem['percent']}%)")
+                    status_info = f"({result.duration_sec}s)"
+                    if result.status != 'success':
+                        status_info = f"({result.status}: {result.error[:30]}...)" if result.error else f"({result.status})"
+                    print(f"[{done}/{len(tasks)}] {icon} {result.filename} {status_info} | Mem: {mem['used_mb']/1024:.1f}GB ({mem['percent']}%)")
             except Exception as e:
                 if verbose:
                     print(f"[{done}/{len(tasks)}] ✗ {f.name}: {e}")
     
     total_time = time.time() - start_time
     
-    # Calculate summary
     success = sum(1 for r in results if r.status == 'success')
     failed = sum(1 for r in results if r.status == 'failed')
     timeouts = sum(1 for r in results if r.status == 'timeout')
@@ -724,6 +750,8 @@ def main():
                         help='Only run tests (files must exist)')
     parser.add_argument('--compare', action='store_true',
                         help='Run both with and without fixes and compare')
+    parser.add_argument('--debug', action='store_true',
+                        help='Enable debug output')
     parser.add_argument('--quiet', '-q', action='store_true',
                         help='Less output')
     
@@ -731,11 +759,9 @@ def main():
     output_dir = Path(args.output_dir)
     verbose = not args.quiet
     
-    # Header
     if verbose:
         print_header("LibreOffice OOM Test Suite (Zero Dependencies)")
     
-    # Check LibreOffice
     soffice = find_libreoffice()
     if soffice:
         print_ok(f"LibreOffice found: {soffice}")
@@ -743,11 +769,9 @@ def main():
         print_err("LibreOffice not found! Please install it.")
         sys.exit(1)
     
-    # Show system info
     mem = get_memory_info()
     print_info(f"System: {os.cpu_count()} CPUs, {mem['total_mb']/1024:.1f}GB RAM")
     
-    # Generate files
     if not args.test_only:
         print_header(f"Generating Test Files (Level: {args.level})")
         generate_test_files(output_dir, args.level, verbose)
@@ -756,29 +780,26 @@ def main():
         print_ok("Test files generated. Use --test-only to run tests.")
         return
     
-    # Run tests
     if args.compare:
-        # Run WITHOUT fixes first
-        print_header("Test 1: WITHOUT Fixes (Baseline)")
+        print_header("Test 1: WITHOUT OOM Fixes (Baseline)")
+        print_warn("This may fail or use more memory - that's expected!")
         baseline = run_stress_test(
             output_dir, args.concurrent, args.rounds, args.timeout,
-            use_fixes=False, verbose=verbose
+            use_fixes=False, verbose=verbose, debug=args.debug
         )
         
-        print("\nWaiting 5 seconds...\n")
+        print("\nWaiting 5 seconds for system to stabilize...\n")
         time.sleep(5)
         
-        # Run WITH fixes
-        print_header("Test 2: WITH Fixes")
+        print_header("Test 2: WITH OOM Fixes Applied")
         with_fixes = run_stress_test(
             output_dir, args.concurrent, args.rounds, args.timeout,
-            use_fixes=True, verbose=verbose
+            use_fixes=True, verbose=verbose, debug=args.debug
         )
         
-        # Compare
         print_header("Comparison Results")
         print(f"{'Metric':<25} {'Baseline':>12} {'With Fixes':>12} {'Change':>10}")
-        print("-" * 60)
+        print("-" * 62)
         
         for key, label in [
             ('success', 'Successful'),
@@ -794,27 +815,26 @@ def main():
             sign = '+' if diff > 0 else ''
             print(f"{label:<25} {b:>12} {f:>12} {sign}{diff:>9.1f}")
         
-        print("-" * 60)
+        print("-" * 62)
         
         if with_fixes['success_rate'] > baseline['success_rate']:
             print_ok(f"Success rate improved by {with_fixes['success_rate'] - baseline['success_rate']:.1f}%")
         if with_fixes['peak_memory_gb'] < baseline['peak_memory_gb']:
-            reduction = (baseline['peak_memory_gb'] - with_fixes['peak_memory_gb']) / baseline['peak_memory_gb'] * 100
+            reduction = (baseline['peak_memory_gb'] - with_fixes['peak_memory_gb']) / baseline['peak_memory_gb'] * 100 if baseline['peak_memory_gb'] > 0 else 0
             print_ok(f"Peak memory reduced by {reduction:.1f}%")
     
     else:
-        # Single test run
-        print_header("Running Stress Test")
+        print_header("Running Stress Test (with OOM fixes)")
         results = run_stress_test(
             output_dir, args.concurrent, args.rounds, args.timeout,
-            use_fixes=True, verbose=verbose
+            use_fixes=True, verbose=verbose, debug=args.debug
         )
         
-        print_header("Results")
+        print_header("Results Summary")
         print(f"Total conversions: {results['total']}")
-        print(f"  Successful: {results['success']}")
-        print(f"  Failed: {results['failed']}")
-        print(f"  Timeouts: {results['timeouts']}")
+        print(f"  ✓ Successful: {results['success']}")
+        print(f"  ✗ Failed: {results['failed']}")
+        print(f"  ⏱ Timeouts: {results['timeouts']}")
         print(f"Success rate: {results['success_rate']}%")
         print(f"Peak memory: {results['peak_memory_gb']} GB")
         print(f"Total time: {results['total_time_sec']}s")
