@@ -2,6 +2,7 @@
 """
 LibreOffice OOM Test with PID Memory Tracking and 2000 MiB Cap
 Auto-escalates concurrency until memory reaches 2000 MiB or OOM occurs
+No external dependencies - uses /proc filesystem
 """
 
 import argparse
@@ -18,42 +19,54 @@ from typing import List, Dict, Optional
 from dataclasses import dataclass
 import threading
 
-# Check for psutil
-try:
-    import psutil
-except ImportError:
-    print("ERROR: psutil not installed")
-    print("Install with: pip install psutil --break-system-packages")
-    sys.exit(1)
-
 # Global memory tracking
 memory_cap_reached = threading.Event()
 MEMORY_CAP_MIB = 2000
 
 # =============================================================================
-# MEMORY TRACKING
+# MEMORY TRACKING VIA /proc
 # =============================================================================
 
 def get_all_libreoffice_pids() -> List[int]:
-    """Find all LibreOffice/soffice process PIDs"""
-    pids = []
-    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-        try:
-            name = proc.info['name'].lower()
-            cmdline = ' '.join(proc.info['cmdline'] or []).lower()
-            if 'soffice' in name or 'libreoffice' in name or 'soffice' in cmdline:
-                pids.append(proc.info['pid'])
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-    return pids
+    """Find all LibreOffice/soffice process PIDs using ps command"""
+    try:
+        result = subprocess.run(
+            ['ps', 'aux'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        
+        pids = []
+        for line in result.stdout.split('\n'):
+            if 'soffice' in line.lower():
+                parts = line.split()
+                if len(parts) >= 2:
+                    try:
+                        pid = int(parts[1])
+                        pids.append(pid)
+                    except ValueError:
+                        continue
+        
+        return pids
+    except Exception:
+        return []
 
 def get_process_memory_mib(pid: int) -> float:
-    """Get memory usage in MiB for a specific PID"""
+    """Get memory usage in MiB for a specific PID using /proc"""
     try:
-        proc = psutil.Process(pid)
-        mem_info = proc.memory_info()
-        return mem_info.rss / (1024 * 1024)
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        status_file = Path(f'/proc/{pid}/status')
+        if not status_file.exists():
+            return 0.0
+        
+        with open(status_file, 'r') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    kb = int(line.split()[1])
+                    return kb / 1024.0
+        
+        return 0.0
+    except Exception:
         return 0.0
 
 def get_total_libreoffice_memory() -> Dict[str, float]:
@@ -83,7 +96,8 @@ def memory_monitor_thread(interval: float = 0.5, verbose: bool = False):
         total_mib = mem_stats['total_mib']
         
         if verbose and mem_stats['process_count'] > 0:
-            print(f"[MEMORY MONITOR] Total: {total_mib:.1f} MiB across {mem_stats['process_count']} processes")
+            print("[MEMORY MONITOR] Total: {:.1f} MiB across {} processes".format(
+                total_mib, mem_stats['process_count']))
         
         if total_mib >= MEMORY_CAP_MIB:
             memory_cap_reached.set()
