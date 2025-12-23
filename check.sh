@@ -18,3 +18,16 @@ env | grep -i "mem\|limit"
 
 # 7. Try to get memory from systemd if available
 cat /proc/1/cgroup 2>/dev/null
+
+
+# Check the actual memory cgroup path for this process
+cat /sys/fs/cgroup/memory/user.slice/user-800540758.slice/session-c32.scope/memory.limit_in_bytes 2>/dev/null
+
+# Check parent cgroup limits
+find /sys/fs/cgroup/memory/user.slice -name "memory.limit_in_bytes" -exec sh -c 'echo "{}:" && cat {}' \; 2>/dev/null | grep -B1 -v 9223372036854771712
+
+# Check systemd slice limits
+systemctl show user-800540758.slice | grep Memory
+
+# Or check via podman
+podman stats --no-stream 2>/dev/null
