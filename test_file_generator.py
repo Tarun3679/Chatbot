@@ -1,525 +1,824 @@
 #!/usr/bin/env python3
 """
-LibreOffice OOM Test File Generator
+LibreOffice OOM Test Suite - ZERO DEPENDENCIES
 
-Generates PowerPoint and Excel files of varying complexity to stress-test
-LibreOffice PDF conversion and reproduce OOM errors.
+This script creates test Office files and runs stress tests using ONLY
+Python standard library. No pip packages required!
+
+Creates valid PPTX/XLSX files using zipfile + XML (Office Open XML format).
 
 Usage:
-    python test_file_generator.py [--output-dir ./test_files] [--level medium]
-    
-Levels:
-    light   - Quick tests, small files
-    medium  - Moderate stress test
-    heavy   - High memory usage
-    extreme - Maximum stress (may cause OOM on low-memory systems)
+    python3 test_suite_standalone.py                     # Run full test
+    python3 test_suite_standalone.py --generate-only     # Just create files
+    python3 test_suite_standalone.py --test-only         # Test existing files
+    python3 test_suite_standalone.py --level heavy       # More stress
+
+Requirements:
+    - Python 3.6+ (standard library only - NO PIP PACKAGES)
+    - Linux operating system
+    - LibreOffice installed
 """
 
 import argparse
 import io
+import json
+import os
 import random
+import shutil
+import subprocess
 import sys
+import tempfile
+import threading
+import time
+import uuid
+import zipfile
+from datetime import datetime
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Dict, Optional
+from dataclasses import dataclass
 
-# Check for required dependencies
-MISSING_DEPS = []
+# =============================================================================
+# CONSOLE OUTPUT 
+# =============================================================================
 
-try:
-    from pptx import Presentation
-    from pptx.util import Inches, Pt
-    from pptx.dml.color import RgbColor
-    from pptx.enum.text import PP_ALIGN
-except ImportError:
-    MISSING_DEPS.append("python-pptx")
+class Colors:
+    RED = '\033[0;31m'
+    GREEN = '\033[0;32m'
+    YELLOW = '\033[1;33m'
+    BLUE = '\033[0;34m'
+    CYAN = '\033[0;36m'
+    NC = '\033[0m'
 
-try:
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
-    from openpyxl.chart import BarChart, LineChart, PieChart, Reference
-    from openpyxl.utils import get_column_letter
-except ImportError:
-    MISSING_DEPS.append("openpyxl")
+if not sys.stdout.isatty():
+    Colors.RED = Colors.GREEN = Colors.YELLOW = Colors.BLUE = Colors.CYAN = Colors.NC = ''
 
-try:
-    from PIL import Image
-    import numpy as np
-except ImportError:
-    MISSING_DEPS.extend(["pillow", "numpy"])
+def print_header(text: str):
+    print(f"\n{Colors.BLUE}{'=' * 65}{Colors.NC}")
+    print(f"{Colors.BLUE}  {text}{Colors.NC}")
+    print(f"{Colors.BLUE}{'=' * 65}{Colors.NC}\n")
 
+def print_ok(text: str):
+    print(f"{Colors.GREEN}[✓]{Colors.NC} {text}")
 
-def check_dependencies():
-    """Check if all required dependencies are installed."""
-    if MISSING_DEPS:
-        print("=" * 60)
-        print("MISSING DEPENDENCIES")
-        print("=" * 60)
-        print(f"Please install the following packages:\n")
-        print(f"    pip install {' '.join(MISSING_DEPS)}")
-        print("\nOr install all at once:")
-        print("    pip install python-pptx openpyxl pillow numpy")
-        print("=" * 60)
-        sys.exit(1)
+def print_warn(text: str):
+    print(f"{Colors.YELLOW}[!]{Colors.NC} {text}")
 
+def print_err(text: str):
+    print(f"{Colors.RED}[✗]{Colors.NC} {text}")
 
-def generate_random_text(word_count: int = 100) -> str:
-    """Generate random lorem ipsum-style text."""
-    words = [
-        'lorem', 'ipsum', 'dolor', 'sit', 'amet', 'consectetur',
-        'adipiscing', 'elit', 'sed', 'do', 'eiusmod', 'tempor',
-        'incididunt', 'ut', 'labore', 'et', 'dolore', 'magna', 'aliqua',
-        'enim', 'ad', 'minim', 'veniam', 'quis', 'nostrud', 'exercitation',
-        'ullamco', 'laboris', 'nisi', 'aliquip', 'ex', 'ea', 'commodo',
-        'consequat', 'duis', 'aute', 'irure', 'in', 'reprehenderit',
-        'voluptate', 'velit', 'esse', 'cillum', 'fugiat', 'nulla', 'pariatur',
-        'excepteur', 'sint', 'occaecat', 'cupidatat', 'non', 'proident',
-        'sunt', 'culpa', 'qui', 'officia', 'deserunt', 'mollit', 'anim'
+def print_info(text: str):
+    print(f"{Colors.CYAN}[i]{Colors.NC} {text}")
+
+# =============================================================================
+# PPTX GENERATOR (Pure Python - ZIP + XML)
+# =============================================================================
+
+def random_text(words: int = 20) -> str:
+    """Generate random filler text."""
+    word_list = [
+        'lorem', 'ipsum', 'dolor', 'sit', 'amet', 'consectetur', 'adipiscing',
+        'elit', 'sed', 'do', 'eiusmod', 'tempor', 'incididunt', 'ut', 'labore',
+        'et', 'dolore', 'magna', 'aliqua', 'enim', 'ad', 'minim', 'veniam',
+        'quis', 'nostrud', 'exercitation', 'ullamco', 'laboris', 'report',
+        'quarterly', 'revenue', 'growth', 'market', 'sales', 'data', 'analysis'
     ]
-    return ' '.join(random.choices(words, k=word_count)).capitalize()
+    return ' '.join(random.choices(word_list, k=words)).capitalize() + '.'
 
 
-def generate_random_image(width: int = 800, height: int = 600, complexity: str = "medium") -> bytes:
+def create_pptx(num_slides: int = 10, text_blocks: int = 3) -> bytes:
     """
-    Generate a random image with varying complexity.
-    
-    Args:
-        width: Image width in pixels
-        height: Image height in pixels
-        complexity: 'low' (solid color), 'medium' (gradients), 'high' (noise)
-    
-    Returns:
-        PNG image as bytes
+    Create a valid PPTX file using only standard library.
+    PPTX = ZIP file containing XML files (Office Open XML format).
     """
-    if complexity == "low":
-        # Solid color with some shapes
-        img_array = np.full((height, width, 3), 
-                           fill_value=random.randint(100, 255), 
-                           dtype=np.uint8)
-    elif complexity == "high":
-        # Full random noise (highest entropy, larger file)
-        img_array = np.random.randint(0, 255, (height, width, 3), dtype=np.uint8)
-    else:  # medium
-        # Gradient with noise
-        img_array = np.zeros((height, width, 3), dtype=np.uint8)
-        for i in range(3):
-            gradient = np.linspace(0, 255, width, dtype=np.uint8)
-            img_array[:, :, i] = np.tile(gradient, (height, 1))
-            img_array[:, :, i] += np.random.randint(0, 50, (height, width), dtype=np.uint8)
+    buf = io.BytesIO()
     
-    img = Image.fromarray(img_array)
-    buffer = io.BytesIO()
-    img.save(buffer, format='PNG', optimize=False)
-    return buffer.getvalue()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        # [Content_Types].xml
+        slide_overrides = '\n'.join(
+            f'  <Override PartName="/ppt/slides/slide{i+1}.xml" '
+            f'ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>'
+            for i in range(num_slides)
+        )
+        content_types = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>
+  <Override PartName="/ppt/slideMasters/slideMaster1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml"/>
+  <Override PartName="/ppt/slideLayouts/slideLayout1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml"/>
+{slide_overrides}
+</Types>'''
+        zf.writestr('[Content_Types].xml', content_types)
+        
+        # _rels/.rels
+        zf.writestr('_rels/.rels', '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/>
+</Relationships>''')
+        
+        # ppt/presentation.xml
+        slide_ids = '\n'.join(f'    <p:sldId id="{256+i}" r:id="rId{i+2}"/>' for i in range(num_slides))
+        zf.writestr('ppt/presentation.xml', f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:presentation xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+    xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+  <p:sldMasterIdLst><p:sldMasterId id="2147483648" r:id="rId1"/></p:sldMasterIdLst>
+  <p:sldIdLst>
+{slide_ids}
+  </p:sldIdLst>
+  <p:sldSz cx="9144000" cy="6858000"/>
+</p:presentation>''')
+        
+        # ppt/_rels/presentation.xml.rels
+        slide_rels = '\n'.join(
+            f'  <Relationship Id="rId{i+2}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide{i+1}.xml"/>'
+            for i in range(num_slides)
+        )
+        zf.writestr('ppt/_rels/presentation.xml.rels', f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="slideMasters/slideMaster1.xml"/>
+{slide_rels}
+</Relationships>''')
+        
+        # ppt/slideMasters/slideMaster1.xml
+        zf.writestr('ppt/slideMasters/slideMaster1.xml', '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sldMaster xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+    xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+  <p:cSld><p:spTree>
+    <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+    <p:grpSpPr/>
+  </p:spTree></p:cSld>
+  <p:clrMap bg1="lt1" tx1="dk1" bg2="lt2" tx2="dk2" accent1="accent1" accent2="accent2" accent3="accent3" accent4="accent4" accent5="accent5" accent6="accent6" hlink="hlink" folHlink="folHlink"/>
+  <p:sldLayoutIdLst><p:sldLayoutId id="2147483649" r:id="rId1"/></p:sldLayoutIdLst>
+</p:sldMaster>''')
+        
+        # ppt/slideMasters/_rels/slideMaster1.xml.rels
+        zf.writestr('ppt/slideMasters/_rels/slideMaster1.xml.rels', '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>
+</Relationships>''')
+        
+        # ppt/slideLayouts/slideLayout1.xml
+        zf.writestr('ppt/slideLayouts/slideLayout1.xml', '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sldLayout xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+    xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" type="blank">
+  <p:cSld><p:spTree>
+    <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+    <p:grpSpPr/>
+  </p:spTree></p:cSld>
+</p:sldLayout>''')
+        
+        # ppt/slideLayouts/_rels/slideLayout1.xml.rels
+        zf.writestr('ppt/slideLayouts/_rels/slideLayout1.xml.rels', '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="../slideMasters/slideMaster1.xml"/>
+</Relationships>''')
+        
+        # Create each slide
+        for slide_num in range(num_slides):
+            # Generate text content for this slide
+            text_shapes = []
+            for block_idx in range(text_blocks):
+                x_pos = 500000 + (block_idx % 2) * 4000000
+                y_pos = 1500000 + (block_idx // 2) * 1500000
+                text_content = random_text(30 + random.randint(0, 20))
+                
+                text_shapes.append(f'''
+    <p:sp>
+      <p:nvSpPr>
+        <p:cNvPr id="{block_idx + 2}" name="TextBox {block_idx + 1}"/>
+        <p:cNvSpPr txBox="1"/>
+        <p:nvPr/>
+      </p:nvSpPr>
+      <p:spPr>
+        <a:xfrm><a:off x="{x_pos}" y="{y_pos}"/><a:ext cx="3500000" cy="1000000"/></a:xfrm>
+        <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+      </p:spPr>
+      <p:txBody>
+        <a:bodyPr wrap="square"/>
+        <a:lstStyle/>
+        <a:p><a:r><a:rPr lang="en-US" sz="1200"/><a:t>{text_content}</a:t></a:r></a:p>
+      </p:txBody>
+    </p:sp>''')
+            
+            slide_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+    xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+  <p:cSld>
+    <p:spTree>
+      <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+      <p:grpSpPr/>
+      <p:sp>
+        <p:nvSpPr><p:cNvPr id="2" name="Title"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
+        <p:spPr>
+          <a:xfrm><a:off x="500000" y="300000"/><a:ext cx="8000000" cy="800000"/></a:xfrm>
+          <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+        </p:spPr>
+        <p:txBody>
+          <a:bodyPr/>
+          <a:lstStyle/>
+          <a:p><a:r><a:rPr lang="en-US" sz="2800" b="1"/><a:t>Slide {slide_num + 1}: {random_text(5)}</a:t></a:r></a:p>
+        </p:txBody>
+      </p:sp>
+      {''.join(text_shapes)}
+    </p:spTree>
+  </p:cSld>
+</p:sld>'''
+            zf.writestr(f'ppt/slides/slide{slide_num + 1}.xml', slide_xml)
+            
+            # Slide rels
+            zf.writestr(f'ppt/slides/_rels/slide{slide_num + 1}.xml.rels', '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>
+</Relationships>''')
+    
+    return buf.getvalue()
 
 
-def create_heavy_powerpoint(
-    num_slides: int = 50,
-    images_per_slide: int = 2,
-    text_boxes_per_slide: int = 5,
-    image_size: tuple = (1024, 768),
-    include_tables: bool = True,
-    include_charts: bool = True,
-    verbose: bool = True,
-) -> bytes:
+# =============================================================================
+# XLSX GENERATOR (Pure Python - ZIP + XML)
+# =============================================================================
+
+def create_xlsx(num_sheets: int = 3, rows_per_sheet: int = 100, cols: int = 10) -> bytes:
     """
-    Create a memory-intensive PowerPoint file.
-    
-    Args:
-        num_slides: Number of slides to create
-        images_per_slide: Number of images per slide (major memory driver)
-        text_boxes_per_slide: Number of text boxes per slide
-        image_size: (width, height) of generated images
-        include_tables: Whether to include tables
-        include_charts: Whether to include charts
-        verbose: Print progress
-    
-    Returns:
-        PowerPoint file as bytes
+    Create a valid XLSX file using only standard library.
+    XLSX = ZIP file containing XML files (Office Open XML format).
     """
-    if verbose:
-        print(f"    Creating PowerPoint: {num_slides} slides, {images_per_slide} images/slide...")
+    buf = io.BytesIO()
     
-    prs = Presentation()
-    prs.slide_width = Inches(13.333)  # Widescreen 16:9
-    prs.slide_height = Inches(7.5)
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        # [Content_Types].xml
+        sheet_overrides = '\n'.join(
+            f'  <Override PartName="/xl/worksheets/sheet{i+1}.xml" '
+            f'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            for i in range(num_sheets)
+        )
+        zf.writestr('[Content_Types].xml', f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+  <Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>
+{sheet_overrides}
+</Types>''')
+        
+        # _rels/.rels
+        zf.writestr('_rels/.rels', '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>''')
+        
+        # xl/workbook.xml
+        sheet_defs = '\n'.join(
+            f'    <sheet name="Sheet{i+1}" sheetId="{i+1}" r:id="rId{i+1}"/>'
+            for i in range(num_sheets)
+        )
+        zf.writestr('xl/workbook.xml', f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets>
+{sheet_defs}
+  </sheets>
+</workbook>''')
+        
+        # xl/_rels/workbook.xml.rels
+        sheet_rels = '\n'.join(
+            f'  <Relationship Id="rId{i+1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{i+1}.xml"/>'
+            for i in range(num_sheets)
+        )
+        zf.writestr('xl/_rels/workbook.xml.rels', f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+{sheet_rels}
+  <Relationship Id="rId{num_sheets+1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+  <Relationship Id="rId{num_sheets+2}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>
+</Relationships>''')
+        
+        # xl/styles.xml (minimal)
+        zf.writestr('xl/styles.xml', '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>
+  <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+  <borders count="1"><border/></borders>
+  <cellStyleXfs count="1"><xf/></cellStyleXfs>
+  <cellXfs count="1"><xf/></cellXfs>
+</styleSheet>''')
+        
+        # Collect all shared strings
+        shared_strings = []
+        shared_string_map = {}
+        
+        def get_string_index(s: str) -> int:
+            if s not in shared_string_map:
+                shared_string_map[s] = len(shared_strings)
+                shared_strings.append(s)
+            return shared_string_map[s]
+        
+        # Create worksheets
+        for sheet_idx in range(num_sheets):
+            rows_xml = []
+            
+            # Header row
+            header_cells = []
+            for c in range(cols):
+                col_letter = chr(65 + c) if c < 26 else f"A{chr(65 + c - 26)}"
+                header_text = f"Column_{col_letter}"
+                str_idx = get_string_index(header_text)
+                header_cells.append(f'<c r="{col_letter}1" t="s"><v>{str_idx}</v></c>')
+            rows_xml.append(f'    <row r="1">{"".join(header_cells)}</row>')
+            
+            # Data rows
+            for row_num in range(2, rows_per_sheet + 2):
+                cells = []
+                for c in range(cols):
+                    col_letter = chr(65 + c) if c < 26 else f"A{chr(65 + c - 26)}"
+                    cell_ref = f"{col_letter}{row_num}"
+                    
+                    # Vary data types
+                    if c % 3 == 0:
+                        # Number
+                        value = random.randint(1, 10000)
+                        cells.append(f'<c r="{cell_ref}"><v>{value}</v></c>')
+                    elif c % 3 == 1:
+                        # Decimal
+                        value = round(random.uniform(0, 1000), 2)
+                        cells.append(f'<c r="{cell_ref}"><v>{value}</v></c>')
+                    else:
+                        # Text
+                        text = random_text(3)
+                        str_idx = get_string_index(text)
+                        cells.append(f'<c r="{cell_ref}" t="s"><v>{str_idx}</v></c>')
+                
+                rows_xml.append(f'    <row r="{row_num}">{"".join(cells)}</row>')
+            
+            # Write worksheet
+            last_col = chr(65 + cols - 1) if cols <= 26 else f"A{chr(65 + cols - 27)}"
+            zf.writestr(f'xl/worksheets/sheet{sheet_idx + 1}.xml', f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:{last_col}{rows_per_sheet + 1}"/>
+  <sheetData>
+{"chr(10)".join(rows_xml)}
+  </sheetData>
+</worksheet>''')
+        
+        # xl/sharedStrings.xml
+        ss_items = '\n'.join(f'  <si><t>{s}</t></si>' for s in shared_strings)
+        zf.writestr('xl/sharedStrings.xml', f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="{len(shared_strings)}" uniqueCount="{len(shared_strings)}">
+{ss_items}
+</sst>''')
     
-    blank_layout = prs.slide_layouts[6]  # Blank slide
+    return buf.getvalue()
+
+
+# =============================================================================
+# SYSTEM UTILITIES
+# =============================================================================
+
+def get_memory_info() -> Dict[str, float]:
+    """Get memory info from /proc/meminfo (Linux)."""
+    try:
+        with open('/proc/meminfo', 'r') as f:
+            info = {}
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2:
+                    info[parts[0].rstrip(':')] = int(parts[1])
+            
+            total = info.get('MemTotal', 0) / 1024
+            avail = info.get('MemAvailable', info.get('MemFree', 0)) / 1024
+            used = total - avail
+            
+            return {
+                'total_mb': total,
+                'used_mb': used,
+                'available_mb': avail,
+                'percent': round(used / total * 100, 1) if total > 0 else 0
+            }
+    except:
+        return {'total_mb': 0, 'used_mb': 0, 'available_mb': 0, 'percent': 0}
+
+
+def find_libreoffice() -> Optional[str]:
+    """Find LibreOffice executable."""
+    paths = [
+        '/usr/bin/soffice',
+        '/usr/bin/libreoffice', 
+        '/usr/local/bin/soffice',
+        '/opt/libreoffice/program/soffice',
+        shutil.which('soffice'),
+        shutil.which('libreoffice'),
+    ]
+    for p in paths:
+        if p and os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def get_optimized_env() -> Dict[str, str]:
+    """Environment variables to reduce LibreOffice memory usage."""
+    env = os.environ.copy()
+    env.update({
+        'SAL_DISABLE_OPENCL': '1',
+        'SAL_DISABLEGL': '1',
+        'SAL_DISABLESKIA': '1',
+        'SAL_USE_VCLPLUGIN': 'gen',
+        'SAL_NO_CRASHREPORT': '1',
+        'JAVA_TOOL_OPTIONS': '-Xmx256m',
+    })
+    return env
+
+
+# =============================================================================
+# CONVERSION & TESTING
+# =============================================================================
+
+@dataclass
+class ConversionResult:
+    filename: str
+    input_size_kb: float
+    output_size_kb: float
+    status: str
+    duration_sec: float
+    error: str = ""
+
+
+def convert_to_pdf(
+    input_path: Path,
+    soffice: str,
+    timeout: int = 120,
+    use_unique_profile: bool = True,
+    use_optimized_env: bool = True
+) -> ConversionResult:
+    """Convert a file to PDF using LibreOffice."""
     
-    for slide_num in range(num_slides):
-        slide = prs.slides.add_slide(blank_layout)
+    input_size = input_path.stat().st_size / 1024
+    start = time.time()
+    
+    with tempfile.TemporaryDirectory(prefix='lo_') as tmp:
+        tmp_path = Path(tmp)
         
-        # Title
-        title_box = slide.shapes.add_textbox(Inches(0.5), Inches(0.2), Inches(12), Inches(0.7))
-        title_frame = title_box.text_frame
-        title_para = title_frame.paragraphs[0]
-        title_para.text = f"Slide {slide_num + 1}: {generate_random_text(8)}"
-        title_para.font.size = Pt(32)
-        title_para.font.bold = True
+        # Copy input to temp
+        tmp_input = tmp_path / input_path.name
+        shutil.copy(input_path, tmp_input)
         
-        # Text boxes
-        for i in range(text_boxes_per_slide):
-            left = Inches(0.5 + (i % 2) * 6.2)
-            top = Inches(1.0 + (i // 2) * 1.3)
-            
-            text_box = slide.shapes.add_textbox(left, top, Inches(5.8), Inches(1.1))
-            tf = text_box.text_frame
-            tf.word_wrap = True
-            
-            para = tf.paragraphs[0]
-            para.text = generate_random_text(40)
-            para.font.size = Pt(11)
+        # Build command
+        cmd = [
+            soffice,
+            '--headless',
+            '--invisible',
+            '--nodefault',
+            '--nofirststartwizard',
+            '--nolockcheck',
+            '--nologo',
+            '--norestore',
+        ]
         
-        # Images (the main memory driver)
-        for i in range(images_per_slide):
-            img_bytes = generate_random_image(
-                width=image_size[0], 
-                height=image_size[1],
-                complexity="high" if i % 2 == 0 else "medium"
-            )
-            img_stream = io.BytesIO(img_bytes)
-            
-            left = Inches(0.3 + (i % 2) * 6.5)
-            top = Inches(4.0 + (i // 2) * 1.8)
-            
-            try:
-                slide.shapes.add_picture(img_stream, left, top, width=Inches(6))
-            except Exception:
-                pass  # Skip if image fails
+        if use_unique_profile:
+            profile = tmp_path / f'profile_{uuid.uuid4().hex[:8]}'
+            profile.mkdir()
+            cmd.append(f'-env:UserInstallation=file://{profile}')
         
-        # Tables
-        if include_tables and slide_num % 4 == 0:
-            rows, cols = 6, 5
-            try:
-                table_shape = slide.shapes.add_table(
-                    rows, cols, 
-                    Inches(1), Inches(2.8), 
-                    Inches(10), Inches(1.8)
+        cmd.extend(['--convert-to', 'pdf', '--outdir', str(tmp_path), str(tmp_input)])
+        
+        env = get_optimized_env() if use_optimized_env else os.environ.copy()
+        
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+            duration = time.time() - start
+            
+            # Find output PDF
+            pdfs = list(tmp_path.glob('*.pdf'))
+            if pdfs:
+                output_size = pdfs[0].stat().st_size / 1024
+                return ConversionResult(
+                    filename=input_path.name,
+                    input_size_kb=input_size,
+                    output_size_kb=output_size,
+                    status='success',
+                    duration_sec=round(duration, 2)
                 )
-                table = table_shape.table
-                
-                for row_idx in range(rows):
-                    for col_idx in range(cols):
-                        cell = table.cell(row_idx, col_idx)
-                        if row_idx == 0:
-                            cell.text = f"Header {col_idx + 1}"
-                        else:
-                            cell.text = f"{random.randint(100, 9999)}"
-            except Exception:
-                pass
+            else:
+                return ConversionResult(
+                    filename=input_path.name,
+                    input_size_kb=input_size,
+                    output_size_kb=0,
+                    status='failed',
+                    duration_sec=round(duration, 2),
+                    error=result.stderr[:200] if result.stderr else 'No PDF output'
+                )
         
-        # Progress indicator
-        if verbose and (slide_num + 1) % 10 == 0:
-            print(f"      Progress: {slide_num + 1}/{num_slides} slides")
-    
-    # Save to bytes
-    buffer = io.BytesIO()
-    prs.save(buffer)
-    buffer.seek(0)
-    
-    if verbose:
-        size_mb = len(buffer.getvalue()) / (1024 * 1024)
-        print(f"    PowerPoint created: {size_mb:.2f} MB")
-    
-    return buffer.getvalue()
+        except subprocess.TimeoutExpired:
+            return ConversionResult(
+                filename=input_path.name,
+                input_size_kb=input_size,
+                output_size_kb=0,
+                status='timeout',
+                duration_sec=timeout,
+                error=f'Timed out after {timeout}s'
+            )
+        except Exception as e:
+            return ConversionResult(
+                filename=input_path.name,
+                input_size_kb=input_size,
+                output_size_kb=0,
+                status='error',
+                duration_sec=time.time() - start,
+                error=str(e)[:200]
+            )
 
 
-def create_heavy_excel(
-    num_sheets: int = 10,
-    rows_per_sheet: int = 10000,
-    cols_per_sheet: int = 20,
-    include_charts: bool = True,
-    include_formatting: bool = True,
-    include_formulas: bool = True,
-    verbose: bool = True,
-) -> bytes:
-    """
-    Create a memory-intensive Excel file.
-    
-    Args:
-        num_sheets: Number of worksheets
-        rows_per_sheet: Rows per sheet
-        cols_per_sheet: Columns per sheet
-        include_charts: Whether to add charts
-        include_formatting: Whether to apply cell formatting
-        include_formulas: Whether to add formulas
-        verbose: Print progress
-    
-    Returns:
-        Excel file as bytes
-    """
-    if verbose:
-        print(f"    Creating Excel: {num_sheets} sheets, {rows_per_sheet} rows each...")
-    
-    wb = Workbook()
-    default_sheet = wb.active
-    
-    # Styles
-    header_font = Font(bold=True, size=11, color="FFFFFF")
-    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-    alt_fill = PatternFill(start_color="D9E2F3", end_color="D9E2F3", fill_type="solid")
-    border = Border(
-        left=Side(style='thin', color='B4B4B4'),
-        right=Side(style='thin', color='B4B4B4'),
-        top=Side(style='thin', color='B4B4B4'),
-        bottom=Side(style='thin', color='B4B4B4')
-    )
-    
-    for sheet_num in range(num_sheets):
-        if sheet_num == 0:
-            ws = default_sheet
-            ws.title = f"DataSheet_{sheet_num + 1}"
-        else:
-            ws = wb.create_sheet(title=f"DataSheet_{sheet_num + 1}")
-        
-        # Headers
-        for col_idx in range(1, cols_per_sheet + 1):
-            cell = ws.cell(row=1, column=col_idx)
-            cell.value = f"Column_{get_column_letter(col_idx)}"
-            if include_formatting:
-                cell.font = header_font
-                cell.fill = header_fill
-                cell.border = border
-                cell.alignment = Alignment(horizontal='center')
-        
-        # Data rows
-        for row_idx in range(2, rows_per_sheet + 2):
-            for col_idx in range(1, cols_per_sheet + 1):
-                cell = ws.cell(row=row_idx, column=col_idx)
-                
-                # Vary data types
-                col_type = col_idx % 5
-                if col_type == 0:
-                    cell.value = generate_random_text(3)
-                elif col_type == 1:
-                    cell.value = random.uniform(-1000, 10000)
-                elif col_type == 2:
-                    cell.value = random.randint(-10000, 100000)
-                elif col_type == 3:
-                    cell.value = f"{random.randint(1, 12)}/{random.randint(1, 28)}/2024"
-                else:
-                    cell.value = random.choice([True, False, None, "N/A"])
-                
-                # Formatting
-                if include_formatting:
-                    cell.border = border
-                    if row_idx % 2 == 0:
-                        cell.fill = alt_fill
-            
-            # Progress for large sheets
-            if verbose and row_idx % 5000 == 0:
-                print(f"      Sheet {sheet_num + 1}: {row_idx}/{rows_per_sheet} rows")
-        
-        # Formulas
-        if include_formulas:
-            # Add SUM formulas in last column
-            for row_idx in range(2, min(rows_per_sheet + 2, 500)):
-                ws.cell(row=row_idx, column=cols_per_sheet).value = \
-                    f"=SUM(B{row_idx}:{get_column_letter(cols_per_sheet - 1)}{row_idx})"
-            
-            # Add summary row
-            summary_row = rows_per_sheet + 3
-            for col_idx in range(2, cols_per_sheet + 1):
-                col_letter = get_column_letter(col_idx)
-                ws.cell(row=summary_row, column=col_idx).value = \
-                    f"=AVERAGE({col_letter}2:{col_letter}{rows_per_sheet + 1})"
-        
-        # Charts
-        if include_charts and sheet_num % 2 == 0:
-            try:
-                # Bar chart
-                chart = BarChart()
-                chart.title = f"Data Analysis - Sheet {sheet_num + 1}"
-                chart.x_axis.title = "Row"
-                chart.y_axis.title = "Value"
-                
-                data = Reference(ws, min_col=2, min_row=1, max_col=5, max_row=min(52, rows_per_sheet))
-                categories = Reference(ws, min_col=1, min_row=2, max_row=min(52, rows_per_sheet))
-                
-                chart.add_data(data, titles_from_data=True)
-                chart.set_categories(categories)
-                chart.width = 18
-                chart.height = 10
-                
-                ws.add_chart(chart, f"{get_column_letter(cols_per_sheet + 2)}2")
-            except Exception:
-                pass  # Skip chart on error
-        
-        if verbose:
-            print(f"      Completed sheet {sheet_num + 1}/{num_sheets}")
-    
-    # Save to bytes
-    buffer = io.BytesIO()
-    wb.save(buffer)
-    buffer.seek(0)
-    
-    if verbose:
-        size_mb = len(buffer.getvalue()) / (1024 * 1024)
-        print(f"    Excel created: {size_mb:.2f} MB")
-    
-    return buffer.getvalue()
+# =============================================================================
+# TEST CONFIGURATIONS
+# =============================================================================
 
-
-# Test file configurations by stress level
 TEST_CONFIGS = {
-    "light": [
-        {"name": "pptx_light_01.pptx", "type": "pptx", 
-         "params": {"num_slides": 5, "images_per_slide": 0, "text_boxes_per_slide": 2}},
-        {"name": "pptx_light_02.pptx", "type": "pptx",
-         "params": {"num_slides": 10, "images_per_slide": 1, "text_boxes_per_slide": 2, "image_size": (640, 480)}},
-        {"name": "xlsx_light_01.xlsx", "type": "xlsx",
-         "params": {"num_sheets": 2, "rows_per_sheet": 500, "cols_per_sheet": 10}},
-        {"name": "xlsx_light_02.xlsx", "type": "xlsx",
-         "params": {"num_sheets": 3, "rows_per_sheet": 1000, "cols_per_sheet": 15}},
-    ],
-    "medium": [
-        {"name": "pptx_medium_01.pptx", "type": "pptx",
-         "params": {"num_slides": 20, "images_per_slide": 1, "text_boxes_per_slide": 3}},
-        {"name": "pptx_medium_02.pptx", "type": "pptx",
-         "params": {"num_slides": 30, "images_per_slide": 2, "text_boxes_per_slide": 4}},
-        {"name": "pptx_medium_03.pptx", "type": "pptx",
-         "params": {"num_slides": 25, "images_per_slide": 2, "text_boxes_per_slide": 3, "image_size": (1280, 720)}},
-        {"name": "xlsx_medium_01.xlsx", "type": "xlsx",
-         "params": {"num_sheets": 5, "rows_per_sheet": 5000, "cols_per_sheet": 20}},
-        {"name": "xlsx_medium_02.xlsx", "type": "xlsx",
-         "params": {"num_sheets": 8, "rows_per_sheet": 8000, "cols_per_sheet": 25}},
-    ],
-    "heavy": [
-        {"name": "pptx_heavy_01.pptx", "type": "pptx",
-         "params": {"num_slides": 50, "images_per_slide": 3, "text_boxes_per_slide": 5}},
-        {"name": "pptx_heavy_02.pptx", "type": "pptx",
-         "params": {"num_slides": 75, "images_per_slide": 2, "text_boxes_per_slide": 4, "image_size": (1920, 1080)}},
-        {"name": "pptx_heavy_03.pptx", "type": "pptx",
-         "params": {"num_slides": 60, "images_per_slide": 4, "text_boxes_per_slide": 6}},
-        {"name": "xlsx_heavy_01.xlsx", "type": "xlsx",
-         "params": {"num_sheets": 10, "rows_per_sheet": 20000, "cols_per_sheet": 30}},
-        {"name": "xlsx_heavy_02.xlsx", "type": "xlsx",
-         "params": {"num_sheets": 15, "rows_per_sheet": 15000, "cols_per_sheet": 35}},
-    ],
-    "extreme": [
-        {"name": "pptx_extreme_01.pptx", "type": "pptx",
-         "params": {"num_slides": 100, "images_per_slide": 4, "text_boxes_per_slide": 6, "image_size": (1920, 1080)}},
-        {"name": "pptx_extreme_02.pptx", "type": "pptx",
-         "params": {"num_slides": 150, "images_per_slide": 3, "text_boxes_per_slide": 5, "image_size": (2560, 1440)}},
-        {"name": "xlsx_extreme_01.xlsx", "type": "xlsx",
-         "params": {"num_sheets": 20, "rows_per_sheet": 50000, "cols_per_sheet": 40}},
-        {"name": "xlsx_extreme_02.xlsx", "type": "xlsx",
-         "params": {"num_sheets": 25, "rows_per_sheet": 40000, "cols_per_sheet": 50}},
-    ],
+    'light': {
+        'pptx': [
+            {'name': 'pptx_small.pptx', 'slides': 5, 'text_blocks': 2},
+            {'name': 'pptx_medium.pptx', 'slides': 10, 'text_blocks': 3},
+        ],
+        'xlsx': [
+            {'name': 'xlsx_small.xlsx', 'sheets': 2, 'rows': 100, 'cols': 8},
+            {'name': 'xlsx_medium.xlsx', 'sheets': 3, 'rows': 500, 'cols': 10},
+        ]
+    },
+    'medium': {
+        'pptx': [
+            {'name': 'pptx_01.pptx', 'slides': 15, 'text_blocks': 4},
+            {'name': 'pptx_02.pptx', 'slides': 25, 'text_blocks': 5},
+            {'name': 'pptx_03.pptx', 'slides': 30, 'text_blocks': 4},
+        ],
+        'xlsx': [
+            {'name': 'xlsx_01.xlsx', 'sheets': 3, 'rows': 1000, 'cols': 12},
+            {'name': 'xlsx_02.xlsx', 'sheets': 5, 'rows': 2000, 'cols': 15},
+            {'name': 'xlsx_03.xlsx', 'sheets': 4, 'rows': 3000, 'cols': 10},
+        ]
+    },
+    'heavy': {
+        'pptx': [
+            {'name': 'pptx_heavy_01.pptx', 'slides': 50, 'text_blocks': 6},
+            {'name': 'pptx_heavy_02.pptx', 'slides': 75, 'text_blocks': 5},
+            {'name': 'pptx_heavy_03.pptx', 'slides': 60, 'text_blocks': 7},
+        ],
+        'xlsx': [
+            {'name': 'xlsx_heavy_01.xlsx', 'sheets': 8, 'rows': 5000, 'cols': 20},
+            {'name': 'xlsx_heavy_02.xlsx', 'sheets': 10, 'rows': 8000, 'cols': 15},
+            {'name': 'xlsx_heavy_03.xlsx', 'sheets': 6, 'rows': 10000, 'cols': 25},
+        ]
+    },
 }
 
 
-def create_test_suite(output_dir: str = "./test_files", level: str = "medium", verbose: bool = True) -> list:
-    """
-    Create a suite of test files at the specified stress level.
+# =============================================================================
+# MAIN FUNCTIONS
+# =============================================================================
+
+def generate_test_files(output_dir: Path, level: str = 'medium', verbose: bool = True) -> List[Path]:
+    """Generate test files for the specified stress level."""
     
-    Args:
-        output_dir: Directory to save test files
-        level: Stress level ('light', 'medium', 'heavy', 'extreme')
-        verbose: Print progress
+    config = TEST_CONFIGS.get(level, TEST_CONFIGS['medium'])
+    output_dir.mkdir(parents=True, exist_ok=True)
     
-    Returns:
-        List of created file info dicts
-    """
-    check_dependencies()
-    
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-    
-    configs = TEST_CONFIGS.get(level, TEST_CONFIGS["medium"])
+    created = []
     
     if verbose:
-        print("=" * 60)
-        print(f"CREATING TEST FILES - Level: {level.upper()}")
-        print(f"Output directory: {output_path.absolute()}")
-        print("=" * 60)
+        print_info(f"Generating {level} test files in {output_dir}")
     
-    created_files = []
-    
-    for i, config in enumerate(configs, 1):
+    # Create PPTX files
+    for cfg in config['pptx']:
         if verbose:
-            print(f"\n[{i}/{len(configs)}] Creating {config['name']}...")
+            print(f"  Creating {cfg['name']} ({cfg['slides']} slides)...", end=' ', flush=True)
         
-        try:
-            if config["type"] == "pptx":
-                file_bytes = create_heavy_powerpoint(**config["params"], verbose=verbose)
-            else:
-                file_bytes = create_heavy_excel(**config["params"], verbose=verbose)
-            
-            filepath = output_path / config["name"]
-            filepath.write_bytes(file_bytes)
-            
-            size_mb = len(file_bytes) / (1024 * 1024)
-            created_files.append({
-                "path": str(filepath),
-                "name": config["name"],
-                "type": config["type"],
-                "size_mb": size_mb,
-                "params": config["params"]
-            })
-            
-            if verbose:
-                print(f"    ✓ Saved: {filepath.name} ({size_mb:.2f} MB)")
-            
-        except Exception as e:
-            if verbose:
-                print(f"    ✗ Failed: {e}")
+        data = create_pptx(num_slides=cfg['slides'], text_blocks=cfg['text_blocks'])
+        path = output_dir / cfg['name']
+        path.write_bytes(data)
+        created.append(path)
+        
+        if verbose:
+            print(f"{len(data) / 1024:.1f} KB")
+    
+    # Create XLSX files
+    for cfg in config['xlsx']:
+        if verbose:
+            print(f"  Creating {cfg['name']} ({cfg['rows']} rows x {cfg['sheets']} sheets)...", end=' ', flush=True)
+        
+        data = create_xlsx(num_sheets=cfg['sheets'], rows_per_sheet=cfg['rows'], cols=cfg['cols'])
+        path = output_dir / cfg['name']
+        path.write_bytes(data)
+        created.append(path)
+        
+        if verbose:
+            print(f"{len(data) / 1024:.1f} KB")
+    
+    return created
+
+
+def run_stress_test(
+    test_dir: Path,
+    concurrent: int = 4,
+    rounds: int = 2,
+    timeout: int = 120,
+    use_fixes: bool = True,
+    verbose: bool = True
+) -> Dict:
+    """Run stress test on files in test_dir."""
+    
+    soffice = find_libreoffice()
+    if not soffice:
+        print_err("LibreOffice not found!")
+        sys.exit(1)
+    
+    # Find test files
+    files = list(test_dir.glob('*.pptx')) + list(test_dir.glob('*.xlsx'))
+    if not files:
+        print_err(f"No test files found in {test_dir}")
+        sys.exit(1)
     
     if verbose:
-        print("\n" + "=" * 60)
-        print("SUMMARY")
-        print("=" * 60)
-        total_size = sum(f["size_mb"] for f in created_files)
-        print(f"Files created: {len(created_files)}")
-        print(f"Total size: {total_size:.2f} MB")
-        print(f"Location: {output_path.absolute()}")
-        print("=" * 60)
+        print_info(f"Found {len(files)} test files")
+        print_info(f"Running {rounds} round(s) with {concurrent} concurrent conversions")
+        print_info(f"Using fixes: {use_fixes}")
+        print()
     
-    return created_files
+    # Build task list
+    tasks = [(f, r) for r in range(rounds) for f in files]
+    results: List[ConversionResult] = []
+    
+    peak_memory = 0
+    start_time = time.time()
+    
+    with ThreadPoolExecutor(max_workers=concurrent) as executor:
+        futures = {
+            executor.submit(
+                convert_to_pdf, f, soffice, timeout,
+                use_unique_profile=use_fixes,
+                use_optimized_env=use_fixes
+            ): (f, r) for f, r in tasks
+        }
+        
+        done = 0
+        for future in as_completed(futures):
+            done += 1
+            f, r = futures[future]
+            
+            # Check memory
+            mem = get_memory_info()
+            if mem['used_mb'] > peak_memory:
+                peak_memory = mem['used_mb']
+            
+            try:
+                result = future.result()
+                results.append(result)
+                
+                if verbose:
+                    icon = '✓' if result.status == 'success' else '✗'
+                    print(f"[{done}/{len(tasks)}] {icon} {result.filename} "
+                          f"({result.duration_sec}s) | Mem: {mem['used_mb']/1024:.1f}GB ({mem['percent']}%)")
+            except Exception as e:
+                if verbose:
+                    print(f"[{done}/{len(tasks)}] ✗ {f.name}: {e}")
+    
+    total_time = time.time() - start_time
+    
+    # Calculate summary
+    success = sum(1 for r in results if r.status == 'success')
+    failed = sum(1 for r in results if r.status == 'failed')
+    timeouts = sum(1 for r in results if r.status == 'timeout')
+    
+    return {
+        'total': len(results),
+        'success': success,
+        'failed': failed,
+        'timeouts': timeouts,
+        'success_rate': round(success / len(results) * 100, 1) if results else 0,
+        'total_time_sec': round(total_time, 1),
+        'avg_duration_sec': round(sum(r.duration_sec for r in results) / len(results), 2) if results else 0,
+        'peak_memory_gb': round(peak_memory / 1024, 2),
+        'results': [r.__dict__ for r in results]
+    }
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate test files for LibreOffice OOM stress testing",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Stress Levels:
-  light    - Small files for quick tests (5-10 slides, 500-1000 rows)
-  medium   - Moderate stress test (20-30 slides, 5000-8000 rows)
-  heavy    - High memory usage (50-75 slides, 15000-20000 rows)
-  extreme  - Maximum stress (100-150 slides, 40000-50000 rows)
-             WARNING: May cause OOM on systems with <8GB RAM
-
-Examples:
-  %(prog)s --level light
-  %(prog)s --level heavy --output-dir /tmp/test_files
-  %(prog)s --level extreme  # Use with caution!
-        """
+        description='LibreOffice OOM Test Suite (Zero Dependencies)',
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    
-    parser.add_argument(
-        "--output-dir", "-o",
-        default="./test_files",
-        help="Output directory for test files (default: ./test_files)"
-    )
-    parser.add_argument(
-        "--level", "-l",
-        choices=["light", "medium", "heavy", "extreme"],
-        default="medium",
-        help="Stress level (default: medium)"
-    )
-    parser.add_argument(
-        "--quiet", "-q",
-        action="store_true",
-        help="Suppress progress output"
-    )
+    parser.add_argument('--output-dir', '-o', default='./test_files',
+                        help='Output directory for test files')
+    parser.add_argument('--level', '-l', choices=['light', 'medium', 'heavy'], default='medium',
+                        help='Stress level')
+    parser.add_argument('--concurrent', '-c', type=int, default=4,
+                        help='Concurrent conversions')
+    parser.add_argument('--rounds', '-r', type=int, default=2,
+                        help='Number of test rounds')
+    parser.add_argument('--timeout', '-t', type=int, default=120,
+                        help='Timeout per conversion (seconds)')
+    parser.add_argument('--generate-only', action='store_true',
+                        help='Only generate test files')
+    parser.add_argument('--test-only', action='store_true',
+                        help='Only run tests (files must exist)')
+    parser.add_argument('--compare', action='store_true',
+                        help='Run both with and without fixes and compare')
+    parser.add_argument('--quiet', '-q', action='store_true',
+                        help='Less output')
     
     args = parser.parse_args()
+    output_dir = Path(args.output_dir)
+    verbose = not args.quiet
     
-    create_test_suite(
-        output_dir=args.output_dir,
-        level=args.level,
-        verbose=not args.quiet
-    )
+    # Header
+    if verbose:
+        print_header("LibreOffice OOM Test Suite (Zero Dependencies)")
+    
+    # Check LibreOffice
+    soffice = find_libreoffice()
+    if soffice:
+        print_ok(f"LibreOffice found: {soffice}")
+    else:
+        print_err("LibreOffice not found! Please install it.")
+        sys.exit(1)
+    
+    # Show system info
+    mem = get_memory_info()
+    print_info(f"System: {os.cpu_count()} CPUs, {mem['total_mb']/1024:.1f}GB RAM")
+    
+    # Generate files
+    if not args.test_only:
+        print_header(f"Generating Test Files (Level: {args.level})")
+        generate_test_files(output_dir, args.level, verbose)
+    
+    if args.generate_only:
+        print_ok("Test files generated. Use --test-only to run tests.")
+        return
+    
+    # Run tests
+    if args.compare:
+        # Run WITHOUT fixes first
+        print_header("Test 1: WITHOUT Fixes (Baseline)")
+        baseline = run_stress_test(
+            output_dir, args.concurrent, args.rounds, args.timeout,
+            use_fixes=False, verbose=verbose
+        )
+        
+        print("\nWaiting 5 seconds...\n")
+        time.sleep(5)
+        
+        # Run WITH fixes
+        print_header("Test 2: WITH Fixes")
+        with_fixes = run_stress_test(
+            output_dir, args.concurrent, args.rounds, args.timeout,
+            use_fixes=True, verbose=verbose
+        )
+        
+        # Compare
+        print_header("Comparison Results")
+        print(f"{'Metric':<25} {'Baseline':>12} {'With Fixes':>12} {'Change':>10}")
+        print("-" * 60)
+        
+        for key, label in [
+            ('success', 'Successful'),
+            ('failed', 'Failed'),
+            ('timeouts', 'Timeouts'),
+            ('success_rate', 'Success Rate (%)'),
+            ('avg_duration_sec', 'Avg Duration (s)'),
+            ('peak_memory_gb', 'Peak Memory (GB)')
+        ]:
+            b = baseline[key]
+            f = with_fixes[key]
+            diff = f - b
+            sign = '+' if diff > 0 else ''
+            print(f"{label:<25} {b:>12} {f:>12} {sign}{diff:>9.1f}")
+        
+        print("-" * 60)
+        
+        if with_fixes['success_rate'] > baseline['success_rate']:
+            print_ok(f"Success rate improved by {with_fixes['success_rate'] - baseline['success_rate']:.1f}%")
+        if with_fixes['peak_memory_gb'] < baseline['peak_memory_gb']:
+            reduction = (baseline['peak_memory_gb'] - with_fixes['peak_memory_gb']) / baseline['peak_memory_gb'] * 100
+            print_ok(f"Peak memory reduced by {reduction:.1f}%")
+    
+    else:
+        # Single test run
+        print_header("Running Stress Test")
+        results = run_stress_test(
+            output_dir, args.concurrent, args.rounds, args.timeout,
+            use_fixes=True, verbose=verbose
+        )
+        
+        print_header("Results")
+        print(f"Total conversions: {results['total']}")
+        print(f"  Successful: {results['success']}")
+        print(f"  Failed: {results['failed']}")
+        print(f"  Timeouts: {results['timeouts']}")
+        print(f"Success rate: {results['success_rate']}%")
+        print(f"Peak memory: {results['peak_memory_gb']} GB")
+        print(f"Total time: {results['total_time_sec']}s")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
